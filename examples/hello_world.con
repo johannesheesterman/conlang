@@ -1,0 +1,2 @@
+extern printf
+printf("Hello, World!\n")
