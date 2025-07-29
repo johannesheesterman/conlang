@@ -2,6 +2,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <llvm-c/Core.h>
+#include <llvm-c/IRReader.h>
+#include <llvm-c/Types.h>
+#include <llvm-c/BitWriter.h>
 
 static int CurrentToken = 0; // Current token type
 static char TokenVal[1024]; // Buffer the text value of the token
@@ -17,12 +21,11 @@ enum Token {
 
 typedef struct AST AST;
 struct AST {
-    enum { AST_NUMBER, AST_STRING, AST_VARIABLE, AST_BINARY, AST_CALL, AST_EXTERN } type;
+    enum { AST_NUMBER, AST_STRING, AST_VARIABLE, AST_CALL, AST_EXTERN } type;
     union {
         struct AST_NUMBER { int value; } AST_NUMBER;
         struct AST_STRING { char* value; } AST_STRING;
         struct AST_VARIABLE { char* name; } AST_VARIABLE;
-        struct AST_BINARY { AST* left;  AST* right; char op; } AST_BINARY;
         struct AST_CALL { char* callee; AST** args; int arg_count; } AST_CALL;
         struct AST_EXTERN { char* name; } AST_EXTERN;
     } data;
@@ -36,6 +39,7 @@ static struct AST* ParseIdentifier();
 static struct AST* ParsePrimary();
 
 static int getToken() {
+
     static int lastChar = ' ';
     while(isspace(lastChar)) lastChar = fgetc(SourceFile);
     
@@ -187,38 +191,73 @@ static struct AST* ParsePrimary() {
     }
 }
 
-static void PrintAst(struct AST* node, int indent) {
-    if (!node) return;
-    for (int i = 0; i < indent; i++) printf("  ");
+static LLVMValueRef GenerateIR(LLVMModuleRef module, LLVMBuilderRef builder, struct AST* node);
+
+
+
+static LLVMValueRef GenerateIR(LLVMModuleRef module, LLVMBuilderRef builder, struct AST* node) {
     switch (node->type) {
-        case AST_NUMBER:
-            printf("AST Number: %d\n", node->data.AST_NUMBER.value);
-            break;
-        case AST_STRING:
-            printf("AST String: %s\n", node->data.AST_STRING.value);
-            break;
-        case AST_VARIABLE:
-            printf("AST Variable: %s\n", node->data.AST_VARIABLE.name);
-            break;
-        case AST_BINARY:
-            printf("AST Binary Operation: %c\n", node->data.AST_BINARY.op);
-            PrintAst(node->data.AST_BINARY.left, indent + 1);
-            PrintAst(node->data.AST_BINARY.right, indent + 1);
-            break;
-        case AST_CALL:
-            printf("AST Function Call: %s with %d args\n", node->data.AST_CALL.callee, node->data.AST_CALL.arg_count);
-            for (int i = 0; i < node->data.AST_CALL.arg_count; i++) {
-                PrintAst(node->data.AST_CALL.args[i], indent + 1);
+        case AST_NUMBER: {
+            return LLVMConstInt(LLVMInt32Type(), node->data.AST_NUMBER.value, 0);
+        }
+        case AST_STRING: {
+            LLVMValueRef global_string = LLVMConstString(node->data.AST_STRING.value, strlen(node->data.AST_STRING.value), 0);
+            LLVMValueRef string_var = LLVMAddGlobal(module, LLVMTypeOf(global_string), "str_const");
+            LLVMSetInitializer(string_var, global_string);
+            LLVMSetGlobalConstant(string_var, 1);
+            LLVMValueRef zero = LLVMConstInt(LLVMInt32Type(), 0, 0);
+            LLVMValueRef indices[] = { zero, zero };
+            return LLVMBuildGEP2(builder, LLVMTypeOf(global_string), string_var, indices, 2, "str_ptr");
+        }
+        case AST_VARIABLE: {
+            return LLVMGetNamedGlobal(module, node->data.AST_VARIABLE.name);
+        }
+        case AST_CALL: {
+            // Function call handling
+            LLVMValueRef callee = LLVMGetNamedFunction(module, node->data.AST_CALL.callee);
+            if (!callee) {
+                fprintf(stderr, "Function '%s' not found\n", node->data.AST_CALL.callee);
+                return NULL;
             }
-            break;
-        case AST_EXTERN:
-            printf("AST Extern function: %s\n", node->data.AST_EXTERN.name);
-            break;
+            LLVMTypeRef func_type;
+            if (strcmp(node->data.AST_CALL.callee, "printf") == 0) {
+                LLVMTypeRef printf_arg_types[] = { LLVMPointerType(LLVMInt8Type(), 0) };
+                func_type = LLVMFunctionType(LLVMInt32Type(), printf_arg_types, 1, 1);
+            } else {
+                func_type = LLVMGetElementType(LLVMTypeOf(callee));
+            }
+            int is_variadic = LLVMIsFunctionVarArg(func_type);
+            // Handle arguments
+            LLVMValueRef* args = malloc(sizeof(LLVMValueRef) * node->data.AST_CALL.arg_count);
+            for (int i = 0; i < node->data.AST_CALL.arg_count; i++) {
+                LLVMValueRef arg_val = GenerateIR(module, builder, node->data.AST_CALL.args[i]);
+                if (node->data.AST_CALL.args[i]->type == AST_STRING) {
+                    args[i] = LLVMBuildPointerCast(builder, arg_val, LLVMPointerType(LLVMInt8Type(), 0), "strcast");
+                } else {
+                    args[i] = arg_val;
+                }
+            }
+            return LLVMBuildCall2(builder, func_type, callee, args, node->data.AST_CALL.arg_count, "calltmp");
+        }
+        case AST_EXTERN: {
+            // Extern function declaration
+            LLVMTypeRef func_type;
+            if (strcmp(node->data.AST_EXTERN.name, "printf") == 0) {
+                LLVMTypeRef printf_arg_types[] = { LLVMPointerType(LLVMInt8Type(), 0) };
+                func_type = LLVMFunctionType(LLVMInt32Type(), printf_arg_types, 1, 1);
+            } else {
+                func_type = LLVMFunctionType(LLVMVoidType(), NULL, 0, 0);
+            }
+            LLVMValueRef func = LLVMAddFunction(module, node->data.AST_EXTERN.name, func_type);
+            LLVMSetLinkage(func, LLVMExternalLinkage);
+            return func;
+        }
         default:
-            fprintf(stderr, "Unknown AST node type: %d\n", node->type);
-            break;
+            logError("Unknown AST node type");
+            return NULL;
     }
 }
+
 
 int main(int argc, char** argv) {
     if (argc != 2) {
@@ -233,19 +272,39 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    struct AST* ast = NULL;
+    LLVMContextRef context = LLVMContextCreate();
+    LLVMModuleRef module = LLVMModuleCreateWithNameInContext("conlang_module", context);
+    LLVMBuilderRef builder = LLVMCreateBuilderInContext(context);
+
+    // Create main function for execution
+    LLVMTypeRef main_func_type = LLVMFunctionType(LLVMInt32Type(), NULL, 0, 0);
+    LLVMValueRef main_func = LLVMAddFunction(module, "main", main_func_type);
+    LLVMBasicBlockRef entry_block = LLVMAppendBasicBlockInContext(context, main_func, "entry");
+    LLVMPositionBuilderAtEnd(builder, entry_block);
+
     getNextToken(); // Initialize the first token
     while (CurrentToken != TOK_EOF) {
         struct AST* node = ParsePrimary();
         if (node) {
-            PrintAst(node, 0);
+            GenerateIR(module, builder, node);
         } else {
             fprintf(stderr, "Error parsing expression\n");
             getNextToken(); // Advance token to avoid infinite loop
         }
     }
 
+    LLVMBuildRet(builder, LLVMConstInt(LLVMInt32Type(), 0, 0));
+
     fclose(SourceFile);
+
+    if (LLVMWriteBitcodeToFile(module, "output.ll") != 0) {
+        fprintf(stderr, "Error writing bitcode to file\n");
+    }
+
+    LLVMDisposeBuilder(builder);
+    LLVMDisposeModule(module);
+    LLVMContextDispose(context);
     
     return 0;
 }
+

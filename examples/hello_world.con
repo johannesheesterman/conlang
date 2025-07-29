@@ -2,4 +2,5 @@ extern printf
 
 
 printf("Hello, World!\n")
-printf("This is a test of the extern function.\n")
+printf("Hello, World!\n")
+printf("Hello, World!\n")
