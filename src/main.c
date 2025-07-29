@@ -13,21 +13,19 @@ static FILE* SourceFile = NULL;
 
 enum Token {
     TOK_EOF = -1,
-    TOK_EXTERN = -2,
-    TOK_IDENTIFIER = -3,
-    TOK_STRING = -4,
-    TOK_NUMBER = -5
+    TOK_IDENTIFIER = -2,
+    TOK_STRING = -3,
+    TOK_NUMBER = -4
 };
 
 typedef struct AST AST;
 struct AST {
-    enum { AST_NUMBER, AST_STRING, AST_VARIABLE, AST_CALL, AST_EXTERN } type;
+    enum { AST_NUMBER, AST_STRING, AST_VARIABLE, AST_CALL } type;
     union {
         struct AST_NUMBER { int value; } AST_NUMBER;
         struct AST_STRING { char* value; } AST_STRING;
         struct AST_VARIABLE { char* name; } AST_VARIABLE;
         struct AST_CALL { char* callee; AST** args; int arg_count; } AST_CALL;
-        struct AST_EXTERN { char* name; } AST_EXTERN;
     } data;
 };
 
@@ -48,7 +46,6 @@ static int getToken() {
         int ix = 1;
         while(isalnum((lastChar = fgetc(SourceFile)))) TokenVal[ix++] = lastChar;
         TokenVal[ix] = '\0';
-        if (strcmp(TokenVal, "extern") == 0) return TOK_EXTERN;
         return TOK_IDENTIFIER;
     }
 
@@ -164,17 +161,6 @@ static struct AST* ParseIdentifier() {
     return AST_NEW(AST_CALL, name, args_copy, arg_count);
 }
 
-static struct AST* ParseExtern() {
-    char* name = strdup(TokenVal); // Memory leak
-    getNextToken(); // Consume 'extern'
-    if (CurrentToken != TOK_IDENTIFIER) {
-        return logError("Expected identifier after 'extern'");
-    }
-    name = strdup(TokenVal); // Memory leak
-    getNextToken(); // Consume identifier
-    return AST_NEW(AST_EXTERN, name);
-}
-
 static struct AST* ParsePrimary() {
     if (CurrentToken == TOK_NUMBER) {
         return ParseNumber();
@@ -182,8 +168,6 @@ static struct AST* ParsePrimary() {
         return ParseString();
     } else if (CurrentToken == TOK_IDENTIFIER) {
         return ParseIdentifier();
-    } else if (CurrentToken == TOK_EXTERN) {
-        return ParseExtern();
     } else if (CurrentToken == '(') {
         return ParseParenExpr();
     } else {
@@ -194,6 +178,26 @@ static struct AST* ParsePrimary() {
 static LLVMValueRef GenerateIR(LLVMModuleRef module, LLVMBuilderRef builder, struct AST* node);
 
 
+LLVMTypeRef GetFunctionType(LLVMModuleRef module, LLVMBuilderRef builder, struct AST_CALL* call) {
+    // TODO: map the function name + arity to cached map
+    LLVMTypeRef* arg_types = malloc(sizeof(LLVMTypeRef) * call->arg_count);
+    for (int i = 0; i < call->arg_count; ++i) {
+        arg_types[i] = LLVMPointerType(LLVMInt8Type(), 0);
+    }
+    LLVMTypeRef func_type = LLVMFunctionType(LLVMInt32Type(), arg_types, call->arg_count, 1);
+    LLVMValueRef func = LLVMAddFunction(module, call->callee, func_type);
+    LLVMSetLinkage(func, LLVMExternalLinkage);
+    return func_type;
+}
+
+LLVMValueRef* GetFunctionArgs(LLVMModuleRef module, LLVMBuilderRef builder, struct AST_CALL* call) {
+    LLVMValueRef* args = malloc(sizeof(LLVMValueRef) * call->arg_count);
+    for (int i = 0; i < call->arg_count; i++) {
+        args[i] = GenerateIR(module, builder, call->args[i]);
+    }
+    return args;
+}
+
 
 static LLVMValueRef GenerateIR(LLVMModuleRef module, LLVMBuilderRef builder, struct AST* node) {
     switch (node->type) {
@@ -201,56 +205,17 @@ static LLVMValueRef GenerateIR(LLVMModuleRef module, LLVMBuilderRef builder, str
             return LLVMConstInt(LLVMInt32Type(), node->data.AST_NUMBER.value, 0);
         }
         case AST_STRING: {
-            LLVMValueRef global_string = LLVMConstString(node->data.AST_STRING.value, strlen(node->data.AST_STRING.value), 0);
-            LLVMValueRef string_var = LLVMAddGlobal(module, LLVMTypeOf(global_string), "str_const");
-            LLVMSetInitializer(string_var, global_string);
-            LLVMSetGlobalConstant(string_var, 1);
-            LLVMValueRef zero = LLVMConstInt(LLVMInt32Type(), 0, 0);
-            LLVMValueRef indices[] = { zero, zero };
-            return LLVMBuildGEP2(builder, LLVMTypeOf(global_string), string_var, indices, 2, "str_ptr");
+            LLVMValueRef global_string = LLVMBuildGlobalString(builder, node->data.AST_STRING.value, "str_const");
+            return global_string;
         }
         case AST_VARIABLE: {
             return LLVMGetNamedGlobal(module, node->data.AST_VARIABLE.name);
         }
         case AST_CALL: {
-            // Function call handling
+            LLVMTypeRef func_type = GetFunctionType(module, builder, &node->data.AST_CALL);
             LLVMValueRef callee = LLVMGetNamedFunction(module, node->data.AST_CALL.callee);
-            if (!callee) {
-                fprintf(stderr, "Function '%s' not found\n", node->data.AST_CALL.callee);
-                return NULL;
-            }
-            LLVMTypeRef func_type;
-            if (strcmp(node->data.AST_CALL.callee, "printf") == 0) {
-                LLVMTypeRef printf_arg_types[] = { LLVMPointerType(LLVMInt8Type(), 0) };
-                func_type = LLVMFunctionType(LLVMInt32Type(), printf_arg_types, 1, 1);
-            } else {
-                func_type = LLVMGetElementType(LLVMTypeOf(callee));
-            }
-            int is_variadic = LLVMIsFunctionVarArg(func_type);
-            // Handle arguments
-            LLVMValueRef* args = malloc(sizeof(LLVMValueRef) * node->data.AST_CALL.arg_count);
-            for (int i = 0; i < node->data.AST_CALL.arg_count; i++) {
-                LLVMValueRef arg_val = GenerateIR(module, builder, node->data.AST_CALL.args[i]);
-                if (node->data.AST_CALL.args[i]->type == AST_STRING) {
-                    args[i] = LLVMBuildPointerCast(builder, arg_val, LLVMPointerType(LLVMInt8Type(), 0), "strcast");
-                } else {
-                    args[i] = arg_val;
-                }
-            }
+            LLVMValueRef* args = GetFunctionArgs(module, builder, &node->data.AST_CALL);
             return LLVMBuildCall2(builder, func_type, callee, args, node->data.AST_CALL.arg_count, "calltmp");
-        }
-        case AST_EXTERN: {
-            // Extern function declaration
-            LLVMTypeRef func_type;
-            if (strcmp(node->data.AST_EXTERN.name, "printf") == 0) {
-                LLVMTypeRef printf_arg_types[] = { LLVMPointerType(LLVMInt8Type(), 0) };
-                func_type = LLVMFunctionType(LLVMInt32Type(), printf_arg_types, 1, 1);
-            } else {
-                func_type = LLVMFunctionType(LLVMVoidType(), NULL, 0, 0);
-            }
-            LLVMValueRef func = LLVMAddFunction(module, node->data.AST_EXTERN.name, func_type);
-            LLVMSetLinkage(func, LLVMExternalLinkage);
-            return func;
         }
         default:
             logError("Unknown AST node type");

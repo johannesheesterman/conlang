@@ -7,9 +7,10 @@ LIBS = $(shell $(LLVM_CONFIG) --libs)
 build:
 	mkdir dist || true
 	clang $(CFLAGS) $(LDFLAGS) -o dist/conlang src/main.c $(LIBS)
-	./dist/conlang examples/hello_world.con # This will generate output.ll
+	./dist/conlang examples/hello_world.con
 	$(shell $(LLVM_CONFIG) --bindir)/llc -filetype=obj output.ll -o output.o
 	clang output.o -o dist/conlang $(LDFLAGS) $(LIBS)
+	rm -f output.ll output.o
 
 
 hello_world:
