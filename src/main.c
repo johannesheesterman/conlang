@@ -260,10 +260,45 @@ int main(int argc, char** argv) {
 
     LLVMBuildRet(builder, LLVMConstInt(LLVMInt32Type(), 0, 0));
 
+    // Generate output filename from input .con file
+    char output_exe[1024];
+    const char* base = strrchr(filename, '/');
+    base = base ? base + 1 : filename;
+    char* dot = strrchr(base, '.');
+    size_t len = dot ? (size_t)(dot - base) : strlen(base);
+    strncpy(output_exe, base, len);
+    output_exe[len] = '\0';
+
+    // Write LLVM IR to <output_exe>.ll
+    char ir_filename[1024];
+    char asm_filename[1024];
+    snprintf(ir_filename, sizeof(ir_filename), "%s.ll", output_exe);
+    snprintf(asm_filename, sizeof(asm_filename), "%s.s", output_exe);
+    char *error = NULL;
+    if (LLVMPrintModuleToFile(module, ir_filename, &error) != 0) {
+        fprintf(stderr, "Error writing LLVM IR to file: %s\n", error);
+        LLVMDisposeMessage(error);
+        fclose(SourceFile);
+        LLVMDisposeBuilder(builder);
+        LLVMDisposeModule(module);
+        LLVMContextDispose(context);
+        return 1;
+    }
+
     fclose(SourceFile);
 
-    if (LLVMWriteBitcodeToFile(module, "output.ll") != 0) {
-        fprintf(stderr, "Error writing bitcode to file\n");
+    // Build shell commands using the output_exe base name
+    char llc_cmd[1024];
+    char clang_cmd[1024];
+    snprintf(llc_cmd, sizeof(llc_cmd), "/opt/homebrew/opt/llvm/bin/llc %s -o %s", ir_filename, asm_filename);
+    snprintf(clang_cmd, sizeof(clang_cmd), "clang %s -o %s", asm_filename, output_exe);
+    // Run llc and clang
+    if (system(llc_cmd) != 0) {
+        fprintf(stderr, "Error running llc\n");
+    } else if (system(clang_cmd) != 0) {
+        fprintf(stderr, "Error running clang\n");
+    } else {
+        printf("Standalone executable generated: %s\n", output_exe);
     }
 
     LLVMDisposeBuilder(builder);
