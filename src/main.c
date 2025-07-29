@@ -113,8 +113,27 @@ static struct AST* ParseNumber() {
 }
 
 static struct AST* ParseString() {
-    char* value = strdup(TokenVal); // Memory leak
-    struct AST* node = AST_NEW(AST_STRING, value);
+    size_t len = strlen(TokenVal);
+    char* buf = malloc(len + 1);
+    char* dst = buf;
+    for (char* src = TokenVal; *src; src++) {
+        if (*src == '\\' && src[1]) {
+            src++;
+            switch (*src) {
+                case 'n': *dst++ = '\n'; break;
+                case 't': *dst++ = '\t'; break;
+                case '\\': *dst++ = '\\'; break;
+                case '"': *dst++ = '"'; break;
+                case 'r': *dst++ = '\r'; break;
+                case '0': *dst++ = '\0'; break;
+                default: *dst++ = *src; break;
+            }
+        } else {
+            *dst++ = *src;
+        }
+    }
+    *dst = '\0';
+    struct AST* node = AST_NEW(AST_STRING, buf);
     getNextToken();
     return node;
 }
@@ -182,7 +201,17 @@ LLVMTypeRef GetFunctionType(LLVMModuleRef module, LLVMBuilderRef builder, struct
     // TODO: map the function name + arity to cached map
     LLVMTypeRef* arg_types = malloc(sizeof(LLVMTypeRef) * call->arg_count);
     for (int i = 0; i < call->arg_count; ++i) {
-        arg_types[i] = LLVMPointerType(LLVMInt8Type(), 0);
+        if (call->args[i]->type == AST_STRING) {
+            arg_types[i] = LLVMPointerType(LLVMInt8Type(), 0); // Strings are passed as pointers
+        } else if (call->args[i]->type == AST_NUMBER) {
+            arg_types[i] = LLVMInt32Type(); // Numbers are passed as integers
+        } else if (call->args[i]->type == AST_VARIABLE) {
+            arg_types[i] = LLVMPointerType(LLVMInt8Type(), 0); // Variables are also pointers
+        } else {
+            logError("Unsupported argument type in function call");
+            free(arg_types);
+            return NULL;
+        }
     }
     LLVMTypeRef func_type = LLVMFunctionType(LLVMInt32Type(), arg_types, call->arg_count, 1);
     LLVMValueRef func = LLVMAddFunction(module, call->callee, func_type);
